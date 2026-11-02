@@ -1,0 +1,17 @@
+# Ignore everything in root by default (scratch exports, caches, GTAV/BeamNG builds)
+/*
+
+# Explicitly track only LiDARCraft project files
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/build_map.py
+!/plugin/
+!/tests/
+
+# Ignore build artifacts inside tracked subfolders
+plugin/target/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store

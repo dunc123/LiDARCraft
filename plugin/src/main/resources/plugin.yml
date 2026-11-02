@@ -1,0 +1,13 @@
+name: LiDARCraft
+version: 1.0.0
+main: com.lidarcraft.LiDARCraftPlugin
+api-version: "1.21"
+load: POSTWORLD
+commands:
+  lidar:
+    aliases: [lc, malvern]
+    description: Teleport, generate, and manage the 1:1 LiDARCraft world
+    usage: /lidar [tp <place|postcode|lat,lon|address>|speed <1-10>|toggle <feature>|pregen|reload]
+  speed:
+    description: Set Creative flying and walking speed (1 to 10)
+    usage: /speed <1-10>

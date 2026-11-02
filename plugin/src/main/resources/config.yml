@@ -1,0 +1,16 @@
+# Generic 1:1 LiDAR + OSM World Generator Configuration
+grid:
+  origin_easting: 366000
+  origin_northing: 252384
+  datum_shift: 104
+  spawn_easting: 376902
+  spawn_northing: 243728
+
+features:
+  roads: true
+  cliffs: true
+  trees: true
+  buildings: true
+  hedges: true
+  flora: true
+  slabs: true
