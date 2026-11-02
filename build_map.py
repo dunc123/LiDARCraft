@@ -26,6 +26,7 @@ import struct
 import threading
 import time
 import urllib.parse
+import zlib
 import requests
 import numpy as np
 from PIL import Image, ImageDraw
@@ -204,13 +205,11 @@ def resolve_location(query: str, force_crs: str = None):
 # 3. Multi-Country LiDAR & Global Elevation Providers
 # ============================================================================
 
-def fetch_aws_terrarium_dem(s_lat: float, w_lon: float, n_lat: float, e_lon: float, out_w=TILE_SIZE, out_h=TILE_SIZE):
+def fetch_aws_terrarium_dem(s_lat: float, w_lon: float, n_lat: float, e_lon: float, out_w=TILE_SIZE, out_h=TILE_SIZE, z=13):
     """
-    Fetch high-precision elevation from AWS Open Data Terrain Tiles (Terrarium z=15).
-    Works globally (100% of Earth), combining open national LiDAR (UK, US 3DEP, Switzerland,
-    Austria, Norway, ArcticDEM) with Copernicus/SRTM at 0.0039m vertical precision.
+    Fetch high-precision elevation from AWS Open Data Terrain Tiles (Terrarium).
+    Uses z=13 by default to avoid z=14/15 coastal bathymetry seam block artifacts.
     """
-    z = 15
     n_tiles = 2 ** z
 
     def lon2x(lon):
@@ -227,20 +226,27 @@ def fetch_aws_terrarium_dem(s_lat: float, w_lon: float, n_lat: float, e_lon: flo
 
     grid_w = (tx1 - tx0 + 1) * 256
     grid_h = (ty1 - ty0 + 1) * 256
-    mosaic = np.zeros((grid_h, grid_w), dtype=np.float32)
+    mosaic = np.full((grid_h, grid_w), np.nan, dtype=np.float32)
 
     for ty in range(ty0, ty1 + 1):
         for tx in range(tx0, tx1 + 1):
             url = f"https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{tx % n_tiles}/{ty}.png"
-            try:
-                r = requests.get(url, timeout=30)
-                if r.status_code == 200:
-                    rgb = np.array(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.float32)
-                    elev = (rgb[:, :, 0] * 256.0 + rgb[:, :, 1] + rgb[:, :, 2] / 256.0) - 32768.0
-                    y_off, x_off = (ty - ty0) * 256, (tx - tx0) * 256
-                    mosaic[y_off : y_off + 256, x_off : x_off + 256] = elev
-            except Exception:
-                pass
+            for _ in range(3):
+                try:
+                    r = requests.get(url, timeout=30)
+                    if r.status_code == 200:
+                        rgb = np.array(Image.open(io.BytesIO(r.content)).convert("RGB"), dtype=np.float32)
+                        elev = (rgb[:, :, 0] * 256.0 + rgb[:, :, 1] + rgb[:, :, 2] / 256.0) - 32768.0
+                        elev = np.clip(elev, -1.0, 8850.0)
+                        y_off, x_off = (ty - ty0) * 256, (tx - tx0) * 256
+                        mosaic[y_off : y_off + 256, x_off : x_off + 256] = elev
+                        break
+                except Exception:
+                    time.sleep(0.3)
+
+    if np.any(np.isnan(mosaic)):
+        valid_med = float(np.nanmedian(mosaic)) if not np.all(np.isnan(mosaic)) else 0.0
+        mosaic = np.nan_to_num(mosaic, nan=valid_med)
 
     px0 = int(round((fx0 - tx0) * 256))
     px1 = max(px0 + 1, int(round((fx1 - tx0) * 256)))
@@ -248,10 +254,78 @@ def fetch_aws_terrarium_dem(s_lat: float, w_lon: float, n_lat: float, e_lon: flo
     py1 = max(py0 + 1, int(round((fy1 - ty0) * 256)))
     cropped = mosaic[max(0, py0) : min(grid_h, py1), max(0, px0) : min(grid_w, px1)]
     if cropped.size == 0:
-        return np.full((out_h, out_w), 50.0, dtype=np.float32)
+        return np.full((out_h, out_w), 0.0, dtype=np.float32)
 
     pil_f = Image.fromarray(cropped, mode="F").resize((out_w, out_h), resample=Image.Resampling.BICUBIC)
-    return np.array(pil_f, dtype=np.float32)
+    return np.clip(np.array(pil_f, dtype=np.float32), -1.0, 8850.0)
+
+
+def fetch_wales_nrw_cog_lidar(cog_url: str, e0: int, e1: int, n0: int, n1: int):
+    """
+    Fetch 1m float32 LiDAR directly from DataMapWales (Natural Resources Wales)
+    Cloud-Optimized BigTIFF via HTTP Range requests (zero GDAL dependency).
+    """
+    hdr = requests.get(cog_url, headers={"Range": "bytes=0-2047"}, timeout=15).content
+    if hdr[:4] != b"II+\x00":
+        raise ValueError("Not a valid Little-Endian BigTIFF")
+    ifd_off = struct.unpack_from("<Q", hdr, 8)[0]
+    n_tags = struct.unpack_from("<Q", hdr, ifd_off)[0]
+    tags = {}
+    for i in range(n_tags):
+        tag, typ, cnt, val = struct.unpack_from("<HHQQ", hdr, ifd_off + 8 + i * 20)
+        tags[tag] = (typ, cnt, val)
+
+    img_w, img_h = int(tags[256][2]), int(tags[257][2])
+    toff_base, tcnt_base = int(tags[324][2]), int(tags[325][2])
+    origin_e, origin_n = struct.unpack_from("<6d", hdr, int(tags[33922][2]))[3:5]
+    tiles_across = (img_w + 255) // 256
+    tiles_down = (img_h + 255) // 256
+
+    px0, px1 = int(round(e0 - origin_e)), int(round(e1 - origin_e))
+    py0, py1 = int(round(origin_n - n1)), int(round(origin_n - n0))
+    if px1 <= 0 or py1 <= 0 or px0 >= img_w or py0 >= img_h:
+        raise ValueError("Bbox outside Wales 1m LiDAR COG bounds")
+
+    tx0, tx1 = max(0, px0 // 256), min(tiles_across - 1, (px1 - 1) // 256)
+    ty0, ty1 = max(0, py0 // 256), min(tiles_down - 1, (py1 - 1) // 256)
+
+    idx_start = ty0 * tiles_across + tx0
+    idx_end = ty1 * tiles_across + tx1
+    off_bytes = requests.get(
+        cog_url, headers={"Range": f"bytes={toff_base + idx_start * 8}-{toff_base + (idx_end + 1) * 8 - 1}"}, timeout=20
+    ).content
+    cnt_bytes = requests.get(
+        cog_url, headers={"Range": f"bytes={tcnt_base + idx_start * 4}-{tcnt_base + (idx_end + 1) * 4 - 1}"}, timeout=20
+    ).content
+    offsets = np.frombuffer(off_bytes, dtype="<u8")
+    counts = np.frombuffer(cnt_bytes, dtype="<u4")
+
+    mosaic = np.full(((ty1 - ty0 + 1) * 256, (tx1 - tx0 + 1) * 256), np.nan, dtype=np.float32)
+    for ty in range(ty0, ty1 + 1):
+        r_idx0 = (ty - ty0) * tiles_across
+        r_idx1 = r_idx0 + (tx1 - tx0)
+        row_offs = offsets[r_idx0 : r_idx1 + 1]
+        row_cnts = counts[r_idx0 : r_idx1 + 1]
+        valid = row_cnts > 0
+        if not np.any(valid):
+            continue
+        b_start = int(np.min(row_offs[valid]))
+        b_end = int(np.max(row_offs[valid] + row_cnts[valid])) - 1
+        chunk = requests.get(cog_url, headers={"Range": f"bytes={b_start}-{b_end}"}, timeout=30).content
+        for j in range(tx1 - tx0 + 1):
+            if row_cnts[j] > 0:
+                s = int(row_offs[j]) - b_start
+                raw = zlib.decompress(chunk[s : s + int(row_cnts[j])])
+                tile = np.frombuffer(raw, dtype="<f4").reshape((256, 256))
+                mosaic[(ty - ty0) * 256 : (ty - ty0 + 1) * 256, j * 256 : (j + 1) * 256] = tile
+
+    sub = mosaic[py0 - ty0 * 256 : py1 - ty0 * 256, px0 - tx0 * 256 : px1 - tx0 * 256]
+    if sub.shape != (TILE_SIZE, TILE_SIZE):
+        out = np.full((TILE_SIZE, TILE_SIZE), np.nan, dtype=np.float32)
+        h_s, w_s = min(TILE_SIZE, sub.shape[0]), min(TILE_SIZE, sub.shape[1])
+        out[:h_s, :w_s] = sub[:h_s, :w_s]
+        return out
+    return sub
 
 
 def fetch_usgs_3dep_dem(s_lat: float, w_lon: float, n_lat: float, e_lon: float, out_w=TILE_SIZE, out_h=TILE_SIZE):
@@ -307,8 +381,9 @@ def fetch_elevation_pair(e0, e1, n0, n1, crs_str: str, country_code: str, custom
         try:
             dtm = np.load(dtm_cache)
             dsm = np.load(dsm_cache)
-            has_dsm = float(np.max(dsm - dtm)) > 0.5
-            return dtm, dsm, has_dsm, "Cached 1m LiDAR"
+            if float(np.max(dtm)) > 0.0 or float(np.min(dtm)) < 0.0:
+                has_dsm = float(np.max(dsm - dtm)) > 0.5
+                return dtm, dsm, has_dsm, "Cached Elevation"
         except Exception:
             pass
 
@@ -316,7 +391,7 @@ def fetch_elevation_pair(e0, e1, n0, n1, crs_str: str, country_code: str, custom
     w_lon, s_lat = to_ll.transform(e0, n0)
     e_lon, n_lat = to_ll.transform(e1, n1)
 
-    # Provider 1: UK Environment Agency 1m DTM + 1m First-Return DSM (EPSG:27700)
+    # Provider 1: UK Environment Agency 1m DTM + 1m First-Return DSM (EPSG:27700, England)
     if crs_str == "EPSG:27700" or country_code == "gb":
         try:
             dtm = fetch_uk_ea_lidar(
@@ -330,7 +405,9 @@ def fetch_elevation_pair(e0, e1, n0, n1, crs_str: str, country_code: str, custom
                 e0, e1, n0, n1,
             )
             bad_dtm = (~np.isfinite(dtm)) | (dtm < -50) | (dtm > 1500)
-            if not np.all(bad_dtm):
+            zero_frac = float(np.mean(dtm == 0.0))
+            # Outside England (e.g. Wales / Scotland), EA WCS returns 0.0 across unmapped tiles
+            if not np.all(bad_dtm) and zero_frac < 0.85:
                 if np.any(bad_dtm):
                     fallback = fetch_aws_terrarium_dem(s_lat, w_lon, n_lat, e_lon)
                     dtm[bad_dtm] = fallback[bad_dtm]
@@ -340,6 +417,34 @@ def fetch_elevation_pair(e0, e1, n0, n1, crs_str: str, country_code: str, custom
                 np.save(dtm_cache, dtm)
                 np.save(dsm_cache, dsm)
                 return dtm, dsm, True, "UK Environment Agency 1m LiDAR (DTM+DSM)"
+        except Exception:
+            pass
+
+        # Provider 1b: DataMapWales (Natural Resources Wales) 1m LiDAR Cloud-Optimized GeoTIFFs (DTM+DSM)
+        try:
+            dtm = fetch_wales_nrw_cog_lidar(
+                "https://dmwproductionblob.blob.core.windows.net/cogs/lidar/wales_dtm_32bit_cog.tif",
+                e0, e1, n0, n1,
+            )
+            bad_dtm = (~np.isfinite(dtm)) | (dtm < -50) | (dtm > 1500)
+            if float(np.mean(~bad_dtm)) > 0.05:
+                dsm = fetch_wales_nrw_cog_lidar(
+                    "https://dmwproductionblob.blob.core.windows.net/cogs/lidar/wales_dsm_32bit_cog.tif",
+                    e0, e1, n0, n1,
+                )
+                if np.any(bad_dtm):
+                    # In coastal tiles (min valid elev < 5m), offshore NoData is sea level (0.0m AOD)
+                    if float(np.percentile(dtm[~bad_dtm], 5)) < 5.0:
+                        dtm[bad_dtm] = 0.0
+                    else:
+                        fallback = fetch_aws_terrarium_dem(s_lat, w_lon, n_lat, e_lon)
+                        dtm[bad_dtm] = fallback[bad_dtm]
+                bad_dsm = (~np.isfinite(dsm)) | (dsm < -50) | (dsm > 1500)
+                if np.any(bad_dsm):
+                    dsm[bad_dsm] = dtm[bad_dsm]
+                np.save(dtm_cache, dtm)
+                np.save(dsm_cache, dsm)
+                return dtm, dsm, True, "Natural Resources Wales 1m LiDAR (DTM+DSM)"
         except Exception:
             pass
 
@@ -504,7 +609,7 @@ def build_tile(
                     osm_tree_nodes.append((int(round(px)), int(round(py))))
                 name = tags.get("name")
                 if name and (0 <= px < w) and (0 <= py < h):
-                    if "place" in tags or tags.get("natural") in ("peak", "saddle") or "historic" in tags:
+                    if "place" in tags or tags.get("natural") in ("peak", "saddle", "bay", "beach", "cape", "headland", "cliff") or "historic" in tags:
                         key = re.sub(r"[^a-z0-9]", "", name.lower())
                         if key:
                             discovered_landmarks[key] = {
@@ -527,6 +632,9 @@ def build_tile(
     farmland_img = Image.new("L", (w, h), 0)
     meadow_img = Image.new("L", (w, h), 0)
     orchard_img = Image.new("L", (w, h), 0)
+    sand_img = Image.new("L", (w, h), 0)
+    shingle_img = Image.new("L", (w, h), 0)
+    cliff_img = Image.new("L", (w, h), 0)
     bldg_id_img = Image.new("I", (w, h), 0)
     bldg_wall_img = Image.new("I", (w, h), 0)
 
@@ -543,12 +651,16 @@ def build_tile(
     draw_farmland = ImageDraw.Draw(farmland_img)
     draw_meadow = ImageDraw.Draw(meadow_img)
     draw_orchard = ImageDraw.Draw(orchard_img)
+    draw_sand = ImageDraw.Draw(sand_img)
+    draw_shingle = ImageDraw.Draw(shingle_img)
+    draw_cliff = ImageDraw.Draw(cliff_img)
     draw_bldg_id = ImageDraw.Draw(bldg_id_img)
     draw_bldg_wall = ImageDraw.Draw(bldg_wall_img)
 
     bldg_meta = {}
     bridge_ways = []
     lamp_positions = []
+    has_coastline = False
     next_bldg_id = 1
 
     for way in ways:
@@ -558,7 +670,12 @@ def build_tile(
             continue
 
         name = tags.get("name")
-        if name and ("historic" in tags or tags.get("tourism") in ("attraction", "viewpoint") or tags.get("railway") == "station"):
+        if name and (
+            "historic" in tags
+            or tags.get("tourism") in ("attraction", "viewpoint")
+            or tags.get("railway") == "station"
+            or tags.get("natural") in ("beach", "bay", "cape", "headland", "cliff")
+        ):
             cx = sum(p[0] for p in pts) / len(pts)
             cy = sum(p[1] for p in pts) / len(pts)
             if 0 <= cx < w and 0 <= cy < h:
@@ -645,13 +762,24 @@ def build_tile(
         elif ww in ("stream", "ditch", "drain"):
             draw_water.line(pts, fill=255, width=2)
 
+        nat = tags.get("natural", "")
+        if nat in ("coastline", "beach", "bay", "shoal", "dune"):
+            has_coastline = True
+        if nat in ("cliff", "ridge", "arete"):
+            draw_cliff.line(pts, fill=255, width=4, joint="curve")
+
         if len(pts) >= 3:
             poly = pts if pts[0] == pts[-1] else pts + [pts[0]]
-            nat = tags.get("natural", "")
             lu = tags.get("landuse", "")
             leis = tags.get("leisure", "")
-            if nat == "water" or lu in ("reservoir", "basin"):
+            if nat in ("water", "bay", "strait") or lu in ("reservoir", "basin"):
                 draw_water.polygon(poly, fill=255)
+            if nat in ("beach", "sand", "dune", "shoal"):
+                draw_sand.polygon(poly, fill=255)
+            if nat in ("shingle", "scree"):
+                draw_shingle.polygon(poly, fill=255)
+            if nat in ("cliff", "bare_rock", "rock"):
+                draw_cliff.polygon(poly, fill=255)
             if nat == "wood" or lu == "forest":
                 draw_wood.polygon(poly, fill=255)
                 if tags.get("leaf_type") == "needleleaved":
@@ -685,8 +813,21 @@ def build_tile(
     farmland_mask = np.array(farmland_img) > 128
     meadow_mask = np.array(meadow_img) > 128
     orchard_mask = np.array(orchard_img) > 128
+    sand_mask = np.array(sand_img) > 128
+    shingle_mask = np.array(shingle_img) > 128
+    cliff_mask = np.array(cliff_img) > 128
     id_arr = np.array(bldg_id_img, dtype=np.int32)
     wall_arr = np.array(bldg_wall_img, dtype=np.int32)
+
+    # Coastal & sea detection: flat ocean surface at 0m AOD where elevation <= 0.35m near coastline/beaches
+    if has_coastline or float(np.percentile(dtm, 5)) <= 0.25:
+        sea_mask = (dtm <= 0.35) & (id_arr == 0) & (paved_arr == 0) & (~sand_mask)
+        if np.any(sea_mask):
+            water_mask = water_mask | sea_mask
+            sea_y = int(np.clip(round(0.0 - datum_shift), -60, 310))
+            y_mc[sea_mask] = sea_y
+            half_step[sea_mask] = 0
+            elev_packed = (y_mc << 1) | half_step
 
     if not has_true_dsm:
         yy_s, xx_s = np.meshgrid(np.arange(h, dtype=np.int32), np.arange(w, dtype=np.int32), indexing="ij")
@@ -856,6 +997,8 @@ def build_tile(
         & (~bldg_buf_mask)
         & (~road_any_mask)
         & (~water_mask)
+        & (~sand_mask)
+        & (~shingle_mask)
         & (~parking_mask)
         & (slope_mag < 0.78)
     )
@@ -893,8 +1036,10 @@ def build_tile(
     nat_surf[park_mask] = 11
     nat_surf[((chm >= 4.0) | wood_mask) & (~bldg_buf_mask)] = 8
     nat_surf[heath_mask | ((rel_prominence > 180.0) & (~wood_mask) & (~farmland_mask))] = 1
+    nat_surf[sand_mask] = 6
+    nat_surf[shingle_mask] = 7
     nat_surf[slope_mag > 0.45] = 3
-    nat_surf[slope_mag > 0.62] = 2
+    nat_surf[(slope_mag > 0.62) | cliff_mask] = 2
     nat_surf[parking_mask] = 10
     nat_surf[water_mask] = 9
 
@@ -1032,15 +1177,20 @@ def bootstrap_paper_server(server_dir: str):
 
     target_jar = os.path.join(plugins_dir, "LiDARCraft-1.0.0.jar")
     if not os.path.exists(target_jar):
-        plugin_src_dir = os.path.join(SCRIPT_DIR, "plugin")
+        plugin_src_dir = os.path.join(BASE_DIR, "plugin")
+        prebuilt_jar = os.path.join(plugin_src_dir, "LiDARCraft-1.0.0.jar")
         built_jar = os.path.join(plugin_src_dir, "target", "LiDARCraft-1.0.0.jar")
-        if not os.path.exists(built_jar) and os.path.exists(os.path.join(plugin_src_dir, "pom.xml")):
-            print("Building LiDARCraft plugin with Maven...", flush=True)
-            import subprocess
-            subprocess.run(["mvn", "clean", "package", "-q"], cwd=plugin_src_dir, shell=(os.name == "nt"), check=True)
-        if os.path.exists(built_jar):
-            shutil.copy2(built_jar, target_jar)
-            print(f"Installed plugin -> {target_jar}", flush=True)
+        if os.path.exists(prebuilt_jar):
+            shutil.copy2(prebuilt_jar, target_jar)
+            print(f"Installed pre-built plugin -> {target_jar}", flush=True)
+        else:
+            if not os.path.exists(built_jar) and os.path.exists(os.path.join(plugin_src_dir, "pom.xml")):
+                print("Building LiDARCraft plugin with Maven...", flush=True)
+                import subprocess
+                subprocess.run(["mvn", "clean", "package", "-DskipTests", "-q"], cwd=plugin_src_dir, shell=(os.name == "nt"), check=True)
+            if os.path.exists(built_jar):
+                shutil.copy2(built_jar, target_jar)
+                print(f"Installed plugin -> {target_jar}", flush=True)
 
 
 def main():
@@ -1128,15 +1278,36 @@ def main():
         write_grid_config(config_path, origin_e, origin_n, datum_shift, crs_str, loc["key"])
     else:
         crs_str = existing_crs
-        center_e0 = origin_e + ((loc["easting"] - origin_e) // TILE_SIZE) * TILE_SIZE
-        center_n1 = origin_n - ((origin_n - loc["northing"]) // TILE_SIZE) * TILE_SIZE
-        probe_dtm, _, _, _ = fetch_elevation_pair(
-            center_e0, center_e0 + TILE_SIZE, center_n1 - TILE_SIZE, center_n1,
-            crs_str, loc["country_code"], args.dtm, args.dsm
-        )
-        p_min, p_max = float(np.min(probe_dtm)), float(np.max(probe_dtm))
-        if (p_min - datum_shift) < -48 or (p_max - datum_shift) > 295:
-            datum_shift = int(math.floor(p_min)) - 32
+        center_tx_probe = (loc["easting"] - origin_e) // TILE_SIZE
+        center_tz_probe = (origin_n - loc["northing"]) // TILE_SIZE
+        neighbor_datum = None
+        for dtx in range(-2, 3):
+            for dtz in range(-2, 3):
+                nb_file = os.path.join(tiles_dir, f"tile_{center_tx_probe + dtx}_{center_tz_probe + dtz}.bin")
+                if os.path.exists(nb_file):
+                    try:
+                        with open(nb_file, "rb") as nf:
+                            hdr = nf.read(16)
+                            if len(hdr) == 16 and hdr[:4] == b"MLV4":
+                                neighbor_datum = struct.unpack(">4siii", hdr)[3]
+                                break
+                    except Exception:
+                        pass
+            if neighbor_datum is not None:
+                break
+
+        if neighbor_datum is not None:
+            datum_shift = neighbor_datum
+        else:
+            center_e0 = origin_e + center_tx_probe * TILE_SIZE
+            center_n1 = origin_n - center_tz_probe * TILE_SIZE
+            probe_dtm, _, _, _ = fetch_elevation_pair(
+                center_e0, center_e0 + TILE_SIZE, center_n1 - TILE_SIZE, center_n1,
+                crs_str, loc["country_code"], args.dtm, args.dsm
+            )
+            p_min, p_max = float(np.min(probe_dtm)), float(np.max(probe_dtm))
+            if (p_min - datum_shift) < -48 or (p_max - datum_shift) > 295:
+                datum_shift = int(math.floor(p_min)) - 32
 
     rel_x = loc["easting"] - origin_e
     rel_z = origin_n - loc["northing"]
@@ -1205,8 +1376,9 @@ def main():
 
     if args.run:
         import subprocess
+        java_bin = os.environ.get("JAVA_BIN", "java")
         print(f"Starting PaperMC server in {args.server_dir} (connect to localhost:25565)...", flush=True)
-        subprocess.run(["java", "-Xms3G", "-Xmx5G", "-jar", "paper.jar", "--nogui"], cwd=args.server_dir)
+        subprocess.run([java_bin, "-Xms3G", "-Xmx5G", "-jar", "paper.jar", "--nogui"], cwd=args.server_dir)
 
 
 if __name__ == "__main__":

@@ -23,17 +23,21 @@ Generate a **1:1 scale (`1 block = 1 metre`) Minecraft world** from real-world 1
 
 ## Setup & Quick Start
 
-You can either let `build_map.py` bootstrap everything in **one command**, or follow the **step-by-step manual setup**.
-
-### Prerequisites
-- **Python 3.10+**
-- **Java 21+** (for PaperMC 1.21+)
-- **Maven** (`mvn`, only needed if compiling the Java plugin from source)
+### Option A: Zero-Prerequisite Launcher (`start.bat` — No Python, Java, or Maven Install Needed!)
+If you're on Windows and just want to play without installing developer tools:
+1. Click **Code -> Download ZIP** on GitHub and extract the folder anywhere on your PC.
+2. Double-click **`start.bat`**.
+   - *No Maven needed:* The compiled `LiDARCraft-1.0.0.jar` plugin is already bundled inside `plugin/`.
+   - *No Java install needed:* `start.bat` automatically finds your Minecraft Launcher's built-in Java 21 (or downloads a portable JRE 21 into `.runtime/` if missing).
+   - *No Python install needed:* If Python isn't installed on your PC, `start.bat` automatically downloads a portable Python 3.12 into `.runtime/` and installs the required packages.
+   - *No server setup needed:* It automatically downloads the latest `paper.jar`, accepts `eula.txt`, configures Creative mode + flight, and asks what place you want to build.
+3. Type any place name, postcode, or Google Maps URL when prompted (e.g. `Three Cliffs Bay, Wales`, `Glastonbury`, or `Kings Cross, London`) and press **Enter**.
+4. Open **Minecraft Java Edition** -> **Multiplayer** -> **Direct Connection** -> type **`localhost`** and click **Join Server**!
 
 ---
 
-### Option A: Automatic One-Command Setup
-`build_map.py` automatically downloads the latest **PaperMC** server jar, accepts `eula.txt`, writes `server.properties` (Creative mode + flight enabled), builds/installs `LiDARCraft-1.0.0.jar`, generates `start_server.bat` / `start_server.sh`, compiles your 1:1 LiDAR + OSM tiles, and (with `--run`) starts the server:
+### Option B: Command-Line Setup (For Developers)
+If you already have **Python 3.10+** and **Java 21+** installed:
 
 ```bash
 pip install -r requirements.txt

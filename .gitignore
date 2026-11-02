@@ -6,11 +6,14 @@
 !/README.md
 !/requirements.txt
 !/build_map.py
+!/start.bat
+!/start.sh
 !/plugin/
 !/tests/
 
-# Ignore build artifacts inside tracked subfolders
+# Ignore build artifacts inside tracked subfolders (keep pre-built plugin/LiDARCraft-1.0.0.jar tracked!)
 plugin/target/
+.runtime/
 __pycache__/
 *.pyc
 .pytest_cache/

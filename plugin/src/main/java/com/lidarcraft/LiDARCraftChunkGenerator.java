@@ -286,6 +286,23 @@ public class LiDARCraftChunkGenerator extends ChunkGenerator {
                 }
                 break;
             }
+            case 6: { // Beach Sand & Dunes
+                chunkData.setRegion(lx, subBottom, lz, lx + 1, topY, lz + 1, Material.SANDSTONE);
+                chunkData.setBlock(lx, topY, lz, Material.SAND);
+                if (slabsEnabled && halfStep && canPlaceAbove) {
+                    chunkData.setBlock(lx, topY + 1, lz, Material.SMOOTH_SANDSTONE_SLAB);
+                } else if (floraEnabled && canPlaceAbove && hMod < 8) {
+                    chunkData.setBlock(lx, topY + 1, lz, (hMod < 3) ? Material.DEAD_BUSH : Material.SHORT_GRASS);
+                }
+                break;
+            }
+            case 7: { // Coastal Shingle & Pebbles
+                chunkData.setRegion(lx, subBottom, lz, lx + 1, topY, lz + 1, Material.STONE);
+                Material shingle = (hMod < 55) ? Material.GRAVEL : (hMod < 80) ? Material.ANDESITE : Material.COBBLESTONE;
+                chunkData.setBlock(lx, topY, lz, shingle);
+                if (slabsEnabled && halfStep && canPlaceAbove) chunkData.setBlock(lx, topY + 1, lz, Material.ANDESITE_SLAB);
+                break;
+            }
             case 8: { // Forest floor
                 chunkData.setRegion(lx, subBottom, lz, lx + 1, topY, lz + 1, Material.DIRT);
                 Material floor = (hMod < 55) ? Material.GRASS_BLOCK : (hMod < 80) ? Material.PODZOL : (hMod < 92) ? Material.MOSS_BLOCK : Material.COARSE_DIRT;
@@ -293,10 +310,15 @@ public class LiDARCraftChunkGenerator extends ChunkGenerator {
                 if (floraEnabled && canPlaceAbove && hMod < 14) chunkData.setBlock(lx, topY + 1, lz, Material.FERN);
                 break;
             }
-            case 9: // Water
-                chunkData.setRegion(lx, subBottom, lz, lx + 1, topY, lz + 1, Material.CLAY);
+            case 9: { // Sea, Rivers & Lakes
+                int bedY = Math.max(minY + 1, topY - 2);
+                chunkData.setBlock(lx, bedY, lz, (hMod < 65) ? Material.SAND : Material.CLAY);
+                if (topY - 1 > bedY) {
+                    chunkData.setBlock(lx, topY - 1, lz, Material.WATER);
+                }
                 chunkData.setBlock(lx, topY, lz, Material.WATER);
                 break;
+            }
             case 10: // Car park
                 chunkData.setRegion(lx, subBottom, lz, lx + 1, topY, lz + 1, Material.STONE);
                 chunkData.setBlock(lx, topY, lz, (hMod < 50) ? Material.GRAVEL : Material.ANDESITE);
