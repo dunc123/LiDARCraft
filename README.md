@@ -6,7 +6,7 @@ Generate a **1:1 scale (`1 block = 1 metre`) Minecraft world** from real-world 1
 
 ## Quick Start
 
-1. Download and extract the repository.
+1. Click the green **`<> Code`** button at the top of this page -> **`Download ZIP`**, and extract the ZIP folder.
 2. Run **`start.bat`** (Windows) or **`./start.sh`** (macOS / Linux).
 3. Enter any place name, postcode, or Google Maps URL when prompted (e.g. `Glastonbury`, `Three Cliffs Bay, Wales`, or `Kings Cross, London`).
 4. Open **Minecraft Java Edition** -> **Multiplayer** -> Connect to **`localhost`**.
